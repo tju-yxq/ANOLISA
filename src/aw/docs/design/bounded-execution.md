@@ -3,8 +3,9 @@
 [中文版](bounded-execution_zh.md)
 
 `aw-exec` runs one command with byte limits, an absolute deadline and cancellation.
-It provides the process transport shared by native hook commands and a future
-Provider Host. It does not depend on `aw-config`, `aw-core` or `aw-provider`.
+It provides the process transport shared by native hook commands and the
+[local Provider Host](provider-host.md). It does not depend on `aw-config`,
+`aw-core` or `aw-provider`.
 
 ## API and ownership
 
@@ -51,7 +52,11 @@ OS calls and kernel-stuck processes do not have a hard realtime bound. The
 caller must not reap this library's children or configure automatic SIGCHLD
 reaping. Error PIDs are diagnostic identifiers and must not be used for later
 signals after the call returns. On unwinding, Drop attempts a group kill and a
-nonblocking reap; forced termination of the calling process cannot run cleanup.
+nonblocking reap. Linux also arms `PR_SET_PDEATHSIG(SIGKILL)` before exec and
+checks for parent death during setup, so a nested transport does not leave its
+immediate command running when its owning thread dies. Privilege-changing execs
+can clear this signal. Forced termination still prevents verified group cleanup
+and does not extend the signal to arbitrary descendants.
 
 Normal completion also terminates remaining members of the command group. This
 transport is for commands whose children share the invocation's bounded lifetime;
@@ -63,8 +68,9 @@ helper threads or reap unrelated children.
 The current delivery serves `tool.before` and `tool.after`. Scheduling remains
 with the native adapter: concurrent calls remain independent, sequential hooks
 remain sequential, and the library does not manufacture after events or approvals.
-Provider protocol integration, daemon/CLI wiring and four-framework adoption
-tests are separate increments. No new `aw.yaml` fields or Core profiles are needed
+`aw-host` composes this transport with the Provider protocol; daemon/CLI wiring
+and four-framework adoption tests remain separate increments. Native command
+callers continue to use `aw-exec` directly. No new `aw.yaml` fields or Core profiles are needed
 for this library.
 
 The extension boundary separates transport, policy evaluation and effect

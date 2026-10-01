@@ -200,7 +200,9 @@ skills = ["apple-notes", "blogwatcher"]
 
 After mounting:
 
-- `/skills` shows skills from the default view.
+- `/skills` shows skills from the default view plus skills not assigned to any view.
+- Mounting leaves `skillfs-views.toml` unchanged; edit it explicitly to persist
+  assignments and remount to apply changed view configuration.
 - `skill-discover/SKILL.md` lists skills from secondary views and their
   readable `source_path` values.
 
@@ -241,7 +243,9 @@ When FUSE reads `SKILL.md`, SkillFS runs `compiler::compile` and supports:
 When there are no conditional blocks, SkillFS also applies a small set of
 heuristic command normalizations, for example:
 
-- `pip install` -> `uv pip install`
+- Bare `pip install` / `pip3 install` -> `uv pip install`; interpreter-specific
+  `python -m pip` calls stay unchanged. Bare invocations use a conservative
+  command-position heuristic rather than a complete shell parser.
 - `python -m venv` -> `uv venv`
 - `npm install` -> `pnpm install` / `yarn install`
 

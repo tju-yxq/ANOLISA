@@ -23,14 +23,13 @@ fn bin_path() -> &'static str {
 
 /// True when `path` is a live mountpoint per `/proc/mounts`. Authoritative
 /// even for a dead FUSE endpoint (where `metadata()` would misbehave).
+/// Delegates to the production byte-exact, escape-decoding matcher.
 fn is_mounted(path: &Path) -> bool {
-    let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(mounts) = std::fs::read("/proc/mounts") else {
         return false;
     };
-    let target = path.to_string_lossy();
-    mounts
-        .lines()
-        .any(|line| line.split_whitespace().nth(1) == Some(&*target))
+    skillfs_fuse::proc_mounts::mounts_contain_target(&mounts, path.as_os_str().as_bytes())
 }
 
 /// Bounded, best-effort force unmount: `fusermount3 -u`, then lazy `-z`, then
@@ -820,6 +819,22 @@ fn non_tmp_dir() -> tempfile::TempDir {
         .expect("non-tmp tempdir")
 }
 
+/// A non-tmp directory short enough to hold a bindable control socket.
+///
+/// `sun_path` caps a socket address at 108 bytes on Linux. `non_tmp_dir()`
+/// lives under `CARGO_TARGET_TMPDIR`, whose length follows the checkout path,
+/// so a checkout nested a few directories deep overruns the cap and the child
+/// exits with "path must be shorter than SUN_LEN". `/dev/shm` is outside the
+/// /tmp and /var/tmp roots the PrivateTmp gate rejects and keeps the socket
+/// address near 45 bytes wherever the repository is checked out. When
+/// `/dev/shm` is missing or not writable it falls back to `non_tmp_dir()`.
+fn non_tmp_socket_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("skillfs-nontmp-")
+        .tempdir_in("/dev/shm")
+        .unwrap_or_else(|_| non_tmp_dir())
+}
+
 /// A collision-resistant leaf name (pid + nanosecond timestamp) so tests
 /// that use a fixed parent directory (e.g. /tmp) never trip over a stale
 /// path left behind by a previous manual run.
@@ -1389,6 +1404,188 @@ fn control_socket_under_tmp_fails_before_mount() {
 
 #[test]
 #[cfg(unix)]
+fn control_socket_relative_path_on_unsafe_cwd_fails_startup() {
+    // A relative --control-socket is served from the cwd: a multi-level
+    // relative path must validate the REAL ancestor chain — the cwd and
+    // everything above it — not just the literal relative components. With
+    // the child's cwd inside a world-writable directory the ancestor
+    // policy rejects the mount; the PrivateTmp gate passes because the cwd
+    // is outside /tmp and /var/tmp.
+    let source = non_tmp_dir();
+    let mount = non_tmp_dir();
+    let unsafe_cwd = non_tmp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(unsafe_cwd.path(), std::fs::Permissions::from_mode(0o0777))
+        .expect("open up the cwd");
+
+    let out = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--activation-mode",
+            "file",
+            "--control-socket",
+            "sub/deeper/control.sock",
+            "--trusted-peer-exe",
+            &test_exe(),
+        ])
+        .current_dir(unsafe_cwd.path())
+        .output()
+        .expect("invoke skillfs");
+    assert!(
+        !out.status.success(),
+        "expected non-zero exit for a multi-level relative socket on an unsafe cwd"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(
+        combined.contains("group/other writable"),
+        "expected the ancestor-writability rejection, got: {combined}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn control_socket_bare_relative_name_tightens_unsafe_cwd() {
+    // A bare relative socket name (`control.sock`) has no parent component
+    // and lives directly in the cwd, which is therefore the socket parent.
+    // The old code returned Ok for an empty parent, silently skipping every
+    // check. Now the real location participates in the same policy as an
+    // absolute path: a world-writable cwd is either tightened to 0700
+    // (when the ancestor chain above it is acceptable) or the mount is
+    // rejected with the ancestor error. Binding with the cwd still
+    // world-writable is the one forbidden outcome.
+    let source = non_tmp_dir();
+    let mount = non_tmp_dir();
+    let unsafe_cwd = non_tmp_dir();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(unsafe_cwd.path(), std::fs::Permissions::from_mode(0o0777))
+        .expect("open up the cwd");
+
+    let mut child = Command::new(bin_path())
+        .args([
+            "mount",
+            source.path().to_str().unwrap(),
+            mount.path().to_str().unwrap(),
+            "--security",
+            "--activation-mode",
+            "file",
+            "--control-socket",
+            "control.sock",
+            "--trusted-peer-exe",
+            &test_exe(),
+        ])
+        .current_dir(unsafe_cwd.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("invoke skillfs");
+
+    // Give the child time to reach the socket setup: gate, tighten-or-
+    // reject, and (if tightened) the bind and FUSE session. Under the full
+    // suite's parallel load the child's own startup can take seconds, so
+    // wait generously before tearing it down; the security outcome is
+    // already decided by the time the mount starts.
+    for _ in 0..200 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if child.try_wait().ok().flatten().is_none() {
+        stop_mount_child(&mut child, mount.path());
+    }
+    use std::io::Read;
+    if let Some(mut out) = child.stdout.take() {
+        let _ = out.read_to_string(&mut stdout);
+    }
+    if let Some(mut err) = child.stderr.take() {
+        let _ = err.read_to_string(&mut stderr);
+    }
+    let status = child.wait().expect("wait for skillfs child");
+    let combined = format!("{stdout}{stderr}\n[child status: {status}]");
+
+    let mode = std::fs::metadata(unsafe_cwd.path())
+        .expect("stat the child's cwd")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert!(
+        mode == 0o700 || combined.contains("socket ancestor"),
+        "an unsafe cwd must be tightened (mode 0700) or the bind rejected \
+         with the ancestor error, got mode {mode:o} and output: {combined}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn control_socket_parent_created_0700_under_permissive_umask() {
+    // Under umask 0000, create_dir_all builds the missing socket-parent
+    // levels as 0777 and the ancestor validation then rejects the path the
+    // mount itself just created. Every level must come out 0700 instead,
+    // so the mount survives the leakiest umask. The child process carries
+    // the umask (`sh -c 'umask 0000 && exec ...'`) because umask is
+    // process-global.
+    let source = non_tmp_dir();
+    let mount = non_tmp_dir();
+    let socket_root = non_tmp_dir();
+    let socket = socket_root.path().join("a").join("b").join("control.sock");
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "umask 0000 && exec {} mount {} {} --security --activation-mode file \
+             --control-socket {} --trusted-peer-exe {}",
+            bin_path(),
+            source.path().display(),
+            mount.path().display(),
+            socket.display(),
+            test_exe(),
+        ))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn skillfs under umask 0000");
+
+    // Give the child time to reach the socket setup. Whatever it does
+    // afterwards (a later gate, a successful mount that keeps running),
+    // the levels it created must already be private.
+    for _ in 0..50 {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("wait for skillfs: {e}"),
+        }
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        stop_mount_child(&mut child, mount.path());
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    for level in ["a", "a/b"] {
+        let path = socket_root.path().join(level);
+        let mode = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("level {level} must exist: {e}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "level {level} must be created 0700 under umask 0000, got {mode:o}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
 fn control_socket_symlink_to_tmp_fails_before_mount() {
     // A control socket whose parent directory symlinks to a real /tmp
     // directory canonicalizes to a PrivateTmp-invisible path and must be
@@ -1499,7 +1696,7 @@ fn control_plane_cli_socket_with_config_trusted_peer_passes_gate() {
     }
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let config_dir = tempfile::tempdir().expect("config dir");
     let config_path = config_dir.path().join("security.toml");
@@ -1575,7 +1772,7 @@ fn control_plane_config_socket_with_cli_trusted_peer_passes_gate() {
     }
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let config_dir = tempfile::tempdir().expect("config dir");
     let config_path = config_dir.path().join("security.toml");
@@ -1972,7 +2169,7 @@ fn trusted_peer_key_with_insecure_permissions_fails_startup() {
 
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let socket_dir = non_tmp_dir();
+    let socket_dir = non_tmp_socket_dir();
     let socket_path = socket_dir.path().join("control.sock");
     let key_dir = non_tmp_dir();
     let key_path = key_dir.path().join("peer.key");
@@ -2079,7 +2276,7 @@ fn control_socket_trusted_peer_exe_nonexistent_fails() {
     // is the gate that fires — not the PrivateTmp gate on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let out = Command::new(bin_path())
         .args([
@@ -2114,7 +2311,7 @@ fn control_socket_trusted_peer_exe_directory_fails() {
     // is the gate that fires — not the PrivateTmp gate on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let dir = tempfile::tempdir().expect("directory for test");
     let out = Command::new(bin_path())
@@ -2325,7 +2522,7 @@ fn control_socket_created_and_accepts_ping() {
     // PrivateTmp gate rejects a daemon-facing source/socket under /tmp.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
 
     // Trusted peer = this test binary, so our own probe authenticates and
@@ -2400,7 +2597,7 @@ fn control_socket_preserves_symlink_source_identity() {
     std::os::unix::fs::symlink(physical_source.path(), &identity_root).unwrap();
 
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let mut child = Command::new(bin_path())
         .args([
@@ -2664,7 +2861,7 @@ fn control_socket_in_place_without_backing_root_fails_startup() {
     // Daemon-visible source and socket so the PrivateTmp gate passes and the
     // in-place backing-root gate is the one that fires.
     let source = non_tmp_dir();
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let out = Command::new(bin_path())
         .args([
@@ -2972,7 +3169,7 @@ fn hermes_control_socket_allowed() {
     // reject the control plane on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let mut child = Command::new(bin_path())
         .args([
@@ -3128,7 +3325,7 @@ fn hermes_config_control_socket_allowed() {
     // reject the control plane on a /tmp fixture.
     let source = non_tmp_dir();
     let mount = tempfile::tempdir().expect("mount tempdir");
-    let sock_dir = non_tmp_dir();
+    let sock_dir = non_tmp_socket_dir();
     let sock_path = sock_dir.path().join("skillfs.sock");
     let config_dir = tempfile::tempdir().expect("config dir");
     let config_path = config_dir.path().join("security.toml");

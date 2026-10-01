@@ -119,8 +119,8 @@ pub fn convert_session_to_atif(
     let mut steps = Vec::new();
     let mut last_system_text: Option<String> = None;
 
-    // Group events by trace_id, preserving order
-    let trace_groups = group_by_trace(&events, &parsed);
+    // Group events into conversation turns, preserving order
+    let trace_groups = group_by_conversation(&events, &parsed);
 
     for (trace_events, trace_parsed) in &trace_groups {
         if trace_events.is_empty() {
@@ -227,31 +227,54 @@ fn parse_event_json(event: &TraceEventDetail) -> Option<LLMCall> {
     }
 }
 
-/// Group events by trace_id, preserving chronological order.
-/// Returns Vec of (events_in_trace, parsed_in_trace).
-fn group_by_trace<'a>(
+/// Group events into conversation turns, preserving chronological order.
+/// Returns Vec of (events_in_turn, parsed_in_turn).
+///
+/// The grouping key is `conversation_id` — the user-query fingerprint that
+/// ties every LLM call of one agent turn together. It is deliberately NOT
+/// `trace_id`: that is the per-call API response id (see
+/// `TraceEventDetail::trace_id`), so keying on it would isolate every call
+/// in its own group and sever the cross-call tool-observation correlation
+/// the caller performs within each group.
+///
+/// Events with no conversation id cannot be attributed to a turn; each
+/// becomes its own singleton group rather than merging under one shared
+/// key, which would correlate unrelated calls with each other merely
+/// because both ids are missing.
+fn group_by_conversation<'a>(
     events: &'a [TraceEventDetail],
     parsed: &'a [Option<LLMCall>],
 ) -> Vec<(Vec<&'a TraceEventDetail>, Vec<&'a Option<LLMCall>>)> {
-    // Maintain insertion order using a Vec of (trace_id, indices)
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    // Group index per conversation id, so turns keep first-appearance order
+    // while their events accumulate.
+    let mut conv_index: HashMap<&str, usize> = HashMap::new();
+    let mut index_groups: Vec<Vec<usize>> = Vec::new();
 
     for (i, event) in events.iter().enumerate() {
-        let tid = event.conversation_id.clone().unwrap_or_default();
-        if !groups.contains_key(&tid) {
-            order.push(tid.clone());
+        match event.conversation_id.as_deref() {
+            Some(id) => {
+                let idx = match conv_index.get(id) {
+                    Some(&idx) => idx,
+                    None => {
+                        index_groups.push(Vec::new());
+                        let idx = index_groups.len() - 1;
+                        conv_index.insert(id, idx);
+                        idx
+                    }
+                };
+                index_groups[idx].push(i);
+            }
+            // Unknown turn: never assume two id-less events belong together.
+            None => index_groups.push(vec![i]),
         }
-        groups.entry(tid).or_default().push(i);
     }
 
-    order
+    index_groups
         .into_iter()
-        .filter_map(|tid| {
-            let indices = groups.remove(&tid)?;
+        .map(|indices| {
             let evts: Vec<_> = indices.iter().map(|&i| &events[i]).collect();
             let prs: Vec<_> = indices.iter().map(|&i| &parsed[i]).collect();
-            Some((evts, prs))
+            (evts, prs)
         })
         .collect()
 }
@@ -273,7 +296,11 @@ fn build_agent_metadata(events: &[TraceEventDetail], parsed: &[Option<LLMCall>])
 
     Agent {
         name,
-        version: "1.0.0".to_string(),
+        // The trace records no agent version, so the export states the
+        // schema's own fallback (`Agent::default_version`) rather than
+        // asserting a number nothing measured — the ATIF viewer renders this
+        // field as the observed agent's version.
+        version: "unknown".to_string(),
         model_name,
         tool_definitions,
         extra: None,
@@ -281,6 +308,10 @@ fn build_agent_metadata(events: &[TraceEventDetail], parsed: &[Option<LLMCall>])
 }
 
 /// Find the most frequently used model across events.
+///
+/// Counts come from a `HashMap`, whose iteration order is randomized per map:
+/// a single-key max reported a different model for equally used ones, so ties
+/// are broken by name.
 fn most_frequent_model(events: &[TraceEventDetail]) -> Option<String> {
     let mut counts: HashMap<&str, usize> = HashMap::new();
     for e in events {
@@ -290,7 +321,7 @@ fn most_frequent_model(events: &[TraceEventDetail]) -> Option<String> {
     }
     counts
         .into_iter()
-        .max_by_key(|&(_, c)| c)
+        .min_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)))
         .map(|(m, _)| m.to_string())
 }
 
@@ -332,7 +363,7 @@ fn extract_system_prompt(event: &TraceEventDetail, parsed: Option<&LLMCall>) -> 
 
     // Strategy 2: from system_instructions column (JSON array of InputMessage)
     if let Some(ref json) = event.system_instructions {
-        if let Ok(msgs) = serde_json::from_str::<Vec<InputMessage>>(json) {
+        if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json) {
             let text = extract_text_from_input_messages(&msgs, "system");
             if !text.is_empty() {
                 return Some(text);
@@ -368,7 +399,7 @@ fn extract_user_query(event: &TraceEventDetail, parsed: Option<&LLMCall>) -> Opt
 
     // Strategy 3: from input_messages column
     if let Some(ref json) = event.input_messages {
-        if let Ok(msgs) = serde_json::from_str::<Vec<InputMessage>>(json) {
+        if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json) {
             let text = extract_last_user_text_from_input(&msgs);
             if let Some(t) = text {
                 return Some(t);
@@ -602,7 +633,7 @@ fn build_observation(
     // Strategy 3: from input_messages column (already incremental — latest round)
     if results.is_empty() {
         if let Some(ref json) = next_event.input_messages {
-            if let Ok(msgs) = serde_json::from_str::<Vec<InputMessage>>(json) {
+            if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json) {
                 collect_tool_responses(&msgs, &tc_ids, &mut results, &mut matched_by_id);
             }
         }
@@ -624,13 +655,26 @@ fn build_observation(
 /// gating on role dropped all of them and left every observation empty. The part
 /// type is the reliable discriminator — `ToolCallResponse` is the only variant
 /// carrying a result, and assistant turns only ever carry `ToolCall`.
+///
+/// Matching runs in two passes: every response that names a call through its id
+/// claims that call first, and only the responses the ids could not place are
+/// matched positionally. A single in-order pass lets an id-less response steal
+/// the slot of a call whose id-bearing response has not been seen yet — parallel
+/// tools complete out of call order, so the replayed round cannot be assumed to
+/// follow it — swapping the two results while both still claim the stolen id.
 fn collect_tool_responses(
     messages: &[InputMessage],
     tc_ids: &HashMap<&str, usize>,
     results: &mut Vec<ObservationResult>,
     matched: &mut [bool],
 ) {
-    let mut positional_idx: usize = 0;
+    // Flatten the responses in message order once; both passes work over the
+    // same list.
+    let mut pending: Vec<(
+        Option<&str>,
+        String,
+        Option<HashMap<String, serde_json::Value>>,
+    )> = Vec::new();
     for msg in messages {
         for part in &msg.parts {
             if let MessagePart::ToolCallResponse { id, response } = part {
@@ -660,49 +704,59 @@ fn collect_tool_responses(
                     serde_json::Value::String(s) => s.clone(),
                     other => serde_json::to_string(other).unwrap_or_default(),
                 };
-
-                // Match by ID first, tolerating the separator differences some
-                // agents introduce when echoing a call id back.
-                if let Some(tc_id) = id {
-                    let found = tc_ids
-                        .iter()
-                        .find(|(known, _)| same_call_id(known, tc_id))
-                        .map(|(_, idx)| *idx);
-                    if let Some(idx) = found {
-                        if !matched[idx] {
-                            matched[idx] = true;
-                            results.push(ObservationResult {
-                                source_call_id: Some(tc_id.clone()),
-                                content: Some(serde_json::Value::String(content_str)),
-                                subagent_trajectory_ref: None,
-                                extra: extra.clone(),
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                // Fallback: positional matching
-                while positional_idx < matched.len() && matched[positional_idx] {
-                    positional_idx += 1;
-                }
-                if positional_idx < matched.len() {
-                    let source_call_id = id.clone().or_else(|| {
-                        tc_ids.iter().find_map(|(known, idx)| {
-                            (*idx == positional_idx).then(|| (*known).to_string())
-                        })
-                    });
-                    matched[positional_idx] = true;
-                    results.push(ObservationResult {
-                        source_call_id,
-                        content: Some(serde_json::Value::String(content_str)),
-                        subagent_trajectory_ref: None,
-                        extra: extra.clone(),
-                    });
-                    positional_idx += 1;
-                }
+                pending.push((id.as_deref(), content_str, extra));
             }
         }
+    }
+
+    // Pass 1 — an id that names a call is authoritative: the response it rides
+    // on belongs to that call whatever order the two arrived in, tolerating the
+    // separator differences some agents introduce when echoing a call id back.
+    for (id, content_str, extra) in &pending {
+        let Some(tc_id) = id else { continue };
+        let found = tc_ids
+            .iter()
+            .find(|(known, _)| same_call_id(known, tc_id))
+            .map(|(_, idx)| *idx);
+        let Some(idx) = found else { continue };
+        if matched[idx] {
+            continue;
+        }
+        matched[idx] = true;
+        results.push(ObservationResult {
+            source_call_id: Some(tc_id.to_string()),
+            content: Some(serde_json::Value::String(content_str.clone())),
+            subagent_trajectory_ref: None,
+            extra: extra.clone(),
+        });
+    }
+
+    // Pass 2 — only id-less responses can use positional fallback. Foreign
+    // and duplicate ids cannot describe an unmatched current call; consuming
+    // a slot for them would discard that call's genuine id-less response.
+    let mut positional_idx: usize = 0;
+    for (id, content_str, extra) in &pending {
+        if id.is_some() {
+            continue;
+        }
+        while positional_idx < matched.len() && matched[positional_idx] {
+            positional_idx += 1;
+        }
+        if positional_idx >= matched.len() {
+            // No unmatched call is left; the response cannot be attributed.
+            break;
+        }
+        let source_call_id = tc_ids
+            .iter()
+            .find_map(|(known, idx)| (*idx == positional_idx).then(|| (*known).to_string()));
+        matched[positional_idx] = true;
+        results.push(ObservationResult {
+            source_call_id,
+            content: Some(serde_json::Value::String(content_str.clone())),
+            subagent_trajectory_ref: None,
+            extra: extra.clone(),
+        });
+        positional_idx += 1;
     }
 }
 
@@ -878,6 +932,20 @@ pub(crate) mod tests {
             ),
             call_event(2, 3_000_000_000, None, Some(replayed_response), None),
         ]
+    }
+
+    /// A trace carries no agent version, so the export must not assert one.
+    ///
+    /// The shared schema's own fallback for an absent version is `unknown`
+    /// (`Agent::default_version`), and the collector's exporter uses the same
+    /// word when its events carry none. The ATIF viewer renders this field as
+    /// the agent's version, so the literal "1.0.0" told every reader that the
+    /// observed agent was version 1.0.0 — a fact nothing measured.
+    #[test]
+    fn exported_agent_version_is_unknown_when_the_trace_carries_none() {
+        let doc = convert_session_to_atif("session-1", two_call_chain()).unwrap();
+
+        assert_eq!(doc.agent.version, "unknown");
     }
 
     #[test]
@@ -1128,6 +1196,44 @@ pub(crate) mod tests {
         assert_eq!(extract_last_user_text(&messages), None);
     }
 
+    /// A row that never completed keeps the raw protocol messages the crash
+    /// drain copied from the request body; its tool result must still become an
+    /// observation instead of being dropped by the strict parse.
+    #[test]
+    fn raw_shaped_columns_still_yield_the_tool_result() {
+        let agent_turn = vec![OutputMessage {
+            role: "assistant".into(),
+            parts: vec![MessagePart::ToolCall {
+                id: Some("tc-raw".into()),
+                name: "list_dir".into(),
+                arguments: Some(serde_json::json!({})),
+            }],
+            name: None,
+            finish_reason: Some("tool_calls".into()),
+        }];
+        let mut replayed = call_event(2, 3_000_000_000, None, None, None);
+        replayed.input_messages =
+            Some(r#"[{"role":"tool","tool_call_id":"tc-raw","content":"raw-a.txt"}]"#.to_string());
+        replayed.system_instructions = None;
+
+        let events = vec![
+            call_event(1, 1_000_000_000, Some(agent_turn), None, Some("list it")),
+            replayed,
+        ];
+
+        let doc = convert_trace_to_atif("trace-raw", events).unwrap();
+        let results = &doc.steps[2]
+            .observation
+            .as_ref()
+            .expect("raw-shaped columns must still produce an observation")
+            .results;
+        assert_eq!(results[0].source_call_id.as_deref(), Some("tc-raw"));
+        assert_eq!(
+            results[0].content.as_ref().and_then(|c| c.as_str()),
+            Some("raw-a.txt")
+        );
+    }
+
     #[test]
     fn test_extract_text_from_input_messages() {
         let messages = vec![InputMessage {
@@ -1239,6 +1345,161 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn id_bearing_response_outranks_the_positional_fallback() {
+        // Two tool calls in one step, replayed with the results arriving out
+        // of call order — parallel tools complete in completion order, not
+        // request order — and only the later response carrying an id. The id
+        // is the authoritative link, so it must attach its response to the
+        // call it names; the id-less response takes the other slot, not the
+        // other way around.
+        let agent_turn = vec![OutputMessage {
+            role: "assistant".into(),
+            parts: vec![
+                MessagePart::ToolCall {
+                    id: Some("tc-a".into()),
+                    name: "Read".into(),
+                    arguments: Some(serde_json::json!({"file_path": "/tmp/a"})),
+                },
+                MessagePart::ToolCall {
+                    id: Some("tc-b".into()),
+                    name: "Read".into(),
+                    arguments: Some(serde_json::json!({"file_path": "/tmp/b"})),
+                },
+            ],
+            name: None,
+            finish_reason: Some("tool_call".into()),
+        }];
+        let replayed = vec![InputMessage {
+            role: "tool".into(),
+            parts: vec![
+                MessagePart::ToolCallResponse {
+                    id: None,
+                    response: serde_json::json!("output of b"),
+                },
+                MessagePart::ToolCallResponse {
+                    id: Some("tc-a".into()),
+                    response: serde_json::json!("output of a"),
+                },
+            ],
+            name: None,
+        }];
+        let events = vec![
+            call_event(1, 1_000_000_000, Some(agent_turn), None, Some("read both")),
+            call_event(2, 3_000_000_000, None, Some(replayed), None),
+        ];
+
+        let doc = convert_trace_to_atif("trace-swap", events).unwrap();
+        let step = &doc.steps[2];
+        assert_eq!(step.tool_calls.as_ref().unwrap().len(), 2);
+
+        let results = &step.observation.as_ref().unwrap().results;
+        assert_eq!(results.len(), 2);
+        let by_id = |id: &str| {
+            results
+                .iter()
+                .find(|r| r.source_call_id.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("no result carries id {id}: {results:?}"))
+        };
+        assert_eq!(
+            by_id("tc-a").content.as_ref().and_then(|c| c.as_str()),
+            Some("output of a"),
+        );
+        assert_eq!(
+            by_id("tc-b").content.as_ref().and_then(|c| c.as_str()),
+            Some("output of b"),
+        );
+    }
+
+    #[test]
+    fn current_results_survive_foreign_and_duplicate_ids() {
+        use crate::grounding::{evidence::build_index, outcome::CallStatus};
+
+        // Exercise typed replay -> ATIF -> grounding, including genuinely
+        // missing results and legacy replay with no IDs at all.
+        for (replay, expected_b) in [
+            (
+                vec![(Some("old-call"), "old"), (Some("tc-a"), "A"), (None, "B")],
+                Some("B"),
+            ),
+            (
+                vec![
+                    (Some("tc-a"), "A"),
+                    (Some("tc-a"), "duplicate"),
+                    (None, "B"),
+                ],
+                Some("B"),
+            ),
+            (vec![(None, "B"), (Some("tc-a"), "A")], Some("B")),
+            (vec![(None, "A"), (None, "B")], Some("B")),
+            (vec![(Some("old-call"), "old"), (Some("tc-a"), "A")], None),
+            (vec![(Some("tc-a"), "A"), (Some("tc-a"), "duplicate")], None),
+            (
+                vec![
+                    (Some("old-call"), "old"),
+                    (Some("tc-b"), "B"),
+                    (Some("tc-a"), "A"),
+                ],
+                Some("B"),
+            ),
+        ] {
+            let output = vec![OutputMessage {
+                role: "assistant".into(),
+                parts: ["tc-a", "tc-b"]
+                    .into_iter()
+                    .map(|id| MessagePart::ToolCall {
+                        id: Some(id.into()),
+                        name: "Read".into(),
+                        arguments: Some(serde_json::json!({"file_path": "/synthetic/log"})),
+                    })
+                    .collect(),
+                name: None,
+                finish_reason: Some("tool_call".into()),
+            }];
+            let input = vec![InputMessage {
+                role: "tool".into(),
+                parts: replay
+                    .into_iter()
+                    .map(|(id, content)| MessagePart::ToolCallResponse {
+                        id: id.map(str::to_string),
+                        response: serde_json::json!(content),
+                    })
+                    .collect(),
+                name: None,
+            }];
+            let doc = convert_trace_to_atif(
+                "synthetic-replay",
+                vec![
+                    call_event(1, 1_000_000_000, Some(output), None, Some("read both")),
+                    call_event(2, 3_000_000_000, None, Some(input), None),
+                ],
+            )
+            .unwrap();
+            let results = &doc.steps[2].observation.as_ref().unwrap().results;
+            assert_eq!(results.len(), if expected_b.is_some() { 2 } else { 1 });
+            let content = |id| {
+                results
+                    .iter()
+                    .find(|r| r.source_call_id.as_deref() == Some(id))
+                    .and_then(|r| r.content.as_ref())
+                    .and_then(|v| v.as_str())
+            };
+            assert_eq!(content("tc-a"), Some("A"));
+            assert_eq!(content("tc-b"), expected_b);
+            let index = build_index(&doc, 0..doc.steps.len());
+            assert_eq!(index.call_verdicts.len(), 2);
+            assert_eq!(index.call_verdicts[0].verdict.status, CallStatus::Ok);
+            assert_eq!(
+                index.call_verdicts[1].verdict.status,
+                if expected_b.is_some() {
+                    CallStatus::Ok
+                } else {
+                    CallStatus::Unknown
+                }
+            );
+        }
+    }
+
+    #[test]
     fn non_string_error_content_remains_reversible_after_flattening() {
         let payload = serde_json::json!({
             "error": {"code": 404, "path": "/tmp/missing"},
@@ -1274,5 +1535,239 @@ pub(crate) mod tests {
         let flattened = result.content.as_ref().and_then(|v| v.as_str()).unwrap();
         let restored: serde_json::Value = serde_json::from_str(flattened).unwrap();
         assert_eq!(restored, payload);
+    }
+
+    /// Event with explicit conversation/trace ids, so tests can control the
+    /// exact grouping the session exporter sees.
+    fn event_with_ids(
+        id: i64,
+        start_ns: i64,
+        conversation_id: Option<&str>,
+        trace_id: Option<&str>,
+        user_query: Option<&str>,
+        output_messages: Option<Vec<OutputMessage>>,
+        input_messages: Option<Vec<InputMessage>>,
+    ) -> TraceEventDetail {
+        TraceEventDetail {
+            id,
+            call_id: Some(format!("call-{id}")),
+            start_timestamp_ns: start_ns,
+            end_timestamp_ns: Some(start_ns + 1_000_000_000),
+            model: Some("claude-opus-5".into()),
+            input_tokens: 100,
+            output_tokens: 20,
+            total_tokens: 120,
+            input_messages: input_messages.map(|m| serde_json::to_string(&m).unwrap()),
+            output_messages: output_messages.map(|m| serde_json::to_string(&m).unwrap()),
+            system_instructions: None,
+            agent_name: Some("Claude".into()),
+            process_name: None,
+            pid: Some(42),
+            user_query: user_query.map(str::to_string),
+            event_json: None,
+            trace_id: trace_id.map(str::to_string),
+            conversation_id: conversation_id.map(str::to_string),
+            cache_read_tokens: None,
+            status: Some("complete".into()),
+            interruption_type: None,
+        }
+    }
+
+    fn tool_call_turn(tc_id: &str) -> Vec<OutputMessage> {
+        vec![OutputMessage {
+            role: "assistant".into(),
+            parts: vec![MessagePart::ToolCall {
+                id: Some(tc_id.into()),
+                name: "Read".into(),
+                arguments: Some(serde_json::json!({"file_path": "/tmp/a"})),
+            }],
+            name: None,
+            finish_reason: Some("tool_call".into()),
+        }]
+    }
+
+    fn replayed_response(tc_id: &str) -> Vec<InputMessage> {
+        vec![InputMessage {
+            role: "tool".into(),
+            parts: vec![MessagePart::ToolCallResponse {
+                id: Some(tc_id.into()),
+                response: serde_json::json!("file contents"),
+            }],
+            name: None,
+        }]
+    }
+
+    #[test]
+    fn session_export_does_not_correlate_events_of_unknown_conversation() {
+        // conversation_id resolution returns None when the request carries no
+        // trailing user text or the response id is missing, so turn
+        // membership is UNKNOWN for both events. Merging them under one
+        // shared key correlates the tool call of one turn with a replayed
+        // response that may belong to an unrelated turn, fabricating an
+        // observation out of thin air.
+        let events = vec![
+            event_with_ids(
+                1,
+                1_000_000_000,
+                None,
+                Some("resp-1"),
+                None,
+                Some(tool_call_turn("tc-x")),
+                None,
+            ),
+            event_with_ids(
+                2,
+                3_000_000_000,
+                None,
+                Some("resp-2"),
+                None,
+                None,
+                Some(replayed_response("tc-x")),
+            ),
+        ];
+
+        let doc = convert_session_to_atif("session-x", events).unwrap();
+
+        // Both calls are still exported, one agent step each — dropping data
+        // would desync step counts from the token totals in final_metrics.
+        let agent_steps: Vec<&Step> = doc
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::Agent)
+            .collect();
+        assert_eq!(agent_steps.len(), 2);
+
+        for step in agent_steps {
+            assert!(
+                step.observation.is_none(),
+                "events of unknown turn must not be cross-correlated: {:?}",
+                step.observation
+            );
+        }
+    }
+
+    #[test]
+    fn session_export_keeps_one_conversation_together_across_distinct_trace_ids() {
+        // trace_id is the per-call API response id: consecutive calls of one
+        // agent turn carry DIFFERENT trace ids. Turn grouping must therefore
+        // key on conversation_id — keying on trace_id would isolate every
+        // call in its own group and sever the tool-call → replayed-response
+        // correlation entirely.
+        let events = vec![
+            event_with_ids(
+                1,
+                1_000_000_000,
+                Some("conv-9"),
+                Some("resp-1"),
+                Some("read /tmp/a"),
+                Some(tool_call_turn("tc-9")),
+                None,
+            ),
+            event_with_ids(
+                2,
+                3_000_000_000,
+                Some("conv-9"),
+                Some("resp-2"),
+                None,
+                None,
+                Some(replayed_response("tc-9")),
+            ),
+        ];
+
+        let doc = convert_session_to_atif("session-9", events).unwrap();
+
+        let sources: Vec<StepSource> = doc.steps.iter().map(|s| s.source).collect();
+        assert_eq!(
+            sources,
+            vec![StepSource::User, StepSource::Agent, StepSource::Agent]
+        );
+
+        let first = &doc.steps[1];
+        let results = &first
+            .observation
+            .as_ref()
+            .expect("calls of one conversation must stay in one group")
+            .results;
+        assert_eq!(results[0].source_call_id.as_deref(), Some("tc-9"));
+    }
+
+    #[test]
+    fn session_export_emits_one_user_step_per_conversation() {
+        let events = vec![
+            event_with_ids(
+                1,
+                1_000_000_000,
+                Some("conv-a"),
+                Some("resp-a1"),
+                Some("first question"),
+                None,
+                None,
+            ),
+            event_with_ids(
+                2,
+                3_000_000_000,
+                Some("conv-b"),
+                Some("resp-b1"),
+                Some("second question"),
+                None,
+                None,
+            ),
+        ];
+
+        let doc = convert_session_to_atif("session-multi", events).unwrap();
+
+        let queries: Vec<&str> = doc
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::User)
+            .map(|s| s.message.as_str())
+            .collect();
+        assert_eq!(queries, vec!["first question", "second question"]);
+    }
+
+    #[test]
+    fn most_frequent_model_breaks_ties_by_name() {
+        // Five models used once each: the counts map is a HashMap, whose
+        // iteration order is randomized per map instance, so a single-key max
+        // reported a different model from call to call.
+        fn calls(models: &[&str]) -> Vec<TraceEventDetail> {
+            models
+                .iter()
+                .enumerate()
+                .map(|(i, model)| {
+                    let mut e = call_event(
+                        i as i64 + 1,
+                        1_000_000_000 + i as i64 * 1_000_000,
+                        None,
+                        None,
+                        Some("hi"),
+                    );
+                    e.model = Some((*model).to_string());
+                    e
+                })
+                .collect()
+        }
+
+        let events = calls(&["zeta", "alpha", "delta", "echo", "bravo"]);
+        let first = most_frequent_model(&events);
+        assert_eq!(first.as_deref(), Some("alpha"));
+        for _ in 0..8 {
+            assert_eq!(
+                most_frequent_model(&events),
+                first,
+                "a tie must not follow the map's iteration order"
+            );
+        }
+
+        // The majority still wins over the name order.
+        let with_majority = calls(&["zeta", "alpha", "delta", "echo", "bravo", "zeta", "zeta"]);
+        assert_eq!(most_frequent_model(&with_majority).as_deref(), Some("zeta"));
+
+        // No model recorded stays None.
+        let mut none = calls(&["zeta", "alpha"]);
+        for e in none.iter_mut() {
+            e.model = None;
+        }
+        assert_eq!(most_frequent_model(&none), None);
     }
 }

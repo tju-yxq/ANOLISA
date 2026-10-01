@@ -46,6 +46,10 @@ pub mod security;
 // `POST /api/sessions/search`, shared by the Linux and macOS server handlers.
 pub mod semantic_search;
 pub mod tokenizer;
+// Cross-platform: offline ChatML token-consumption breakdown over Chrome
+// Trace files (`agentsight analyze-chatml`); pure analysis over `chrome_trace`
+// and `tokenizer`, no eBPF dependency.
+pub mod token_breakdown;
 pub mod utils;
 
 // ─── Linux-only modules (eBPF observability pipeline) ──────────────────────
@@ -82,6 +86,8 @@ pub mod parser;
 pub mod probes;
 #[cfg(target_os = "linux")]
 pub mod response_map;
+#[cfg(target_os = "linux")]
+mod runtime_metrics;
 #[cfg(all(feature = "server", target_os = "linux"))]
 pub mod server;
 #[cfg(target_os = "linux")]
@@ -142,6 +148,17 @@ pub use storage::{
 };
 #[cfg(target_os = "linux")]
 pub use unified::AgentSight;
+
+/// Runs a callback with AgentSight pipeline metrics enabled.
+///
+/// The caller must install a local or global `metrics` recorder before invoking
+/// pipeline code. This hidden API exists for benchmark harnesses that need to
+/// collect the same instrumentation used by the AgentSight runtime.
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub fn with_runtime_metrics_enabled<T>(callback: impl FnOnce() -> T) -> T {
+    runtime_metrics::with_observability_enabled(callback)
+}
 
 #[cfg(all(test, feature = "server", target_os = "linux"))]
 mod tests {

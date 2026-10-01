@@ -9,7 +9,9 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::genai::semantic::{InputMessage, MessagePart, OutputMessage};
+#[cfg(test)]
+use crate::genai::semantic::InputMessage;
+use crate::genai::semantic::{MessagePart, OutputMessage};
 use crate::storage::sqlite::genai::TraceEventDetail;
 
 use super::types::{SkillDownloadRecord, SkillLoadRecord};
@@ -65,10 +67,13 @@ const SKILL_FUNCTION_NAMES: &[&str] = &["skill", "skill_view"];
 /// For other agents: parses `system_instructions` JSON (Vec<InputMessage>)
 /// and applies regex to extract skill names from the XML block.
 pub fn extract_skill_downloads(event: &TraceEventDetail) -> Vec<SkillDownloadRecord> {
+    // conversation_id groups every LLM call of one user query (the task
+    // these session records are documented over); trace_id is the per-call
+    // response id and only remains as a fallback.
     let session_id = event
-        .trace_id
+        .conversation_id
         .clone()
-        .or_else(|| event.conversation_id.clone())
+        .or_else(|| event.trace_id.clone())
         .unwrap_or_default();
     let timestamp_ns = event.start_timestamp_ns;
 
@@ -177,10 +182,13 @@ fn detect_skill_load(name: &str, arguments: &Option<serde_json::Value>) -> Optio
 /// Looks for tool calls where function_name matches Read/ReadFile/read_file
 /// and the file_path argument ends with `/SKILL.md`.
 pub fn extract_skill_loads(event: &TraceEventDetail) -> Vec<SkillLoadRecord> {
+    // conversation_id groups every LLM call of one user query (the task
+    // these session records are documented over); trace_id is the per-call
+    // response id and only remains as a fallback.
     let session_id = event
-        .trace_id
+        .conversation_id
         .clone()
-        .or_else(|| event.conversation_id.clone())
+        .or_else(|| event.trace_id.clone())
         .unwrap_or_default();
     let call_id = event.call_id.clone().unwrap_or_default();
     let timestamp_ns = event.start_timestamp_ns;
@@ -246,7 +254,7 @@ pub fn extract_tool_function_names(event: &TraceEventDetail) -> Vec<String> {
 fn extract_system_text(event: &TraceEventDetail) -> String {
     if let Some(json_str) = &event.system_instructions {
         // Try parsing as Vec<InputMessage> first
-        if let Ok(msgs) = serde_json::from_str::<Vec<InputMessage>>(json_str) {
+        if let Some(msgs) = crate::genai::semantic::input_messages_from_column(json_str) {
             let mut text = String::new();
             for msg in &msgs {
                 if msg.role == "system" {
@@ -377,22 +385,32 @@ fn parse_available_skills(text: &str) -> Vec<String> {
 
     for block_match in RE_AVAILABLE_SKILLS.captures_iter(text) {
         let block = &block_match[1];
+        // Names found in this block only: the XML-vs-Hermes format decision
+        // must be made per block, so a plain-text block is never suppressed
+        // by skills already collected from an earlier one.
+        let mut block_names = Vec::new();
 
         // Try XML format first (cosh/generic agents)
         for name_match in RE_SKILL_NAME.captures_iter(block) {
             let name = name_match[1].trim().to_string();
-            if !name.is_empty() && !skill_names.contains(&name) {
-                skill_names.push(name);
+            if !name.is_empty() && !block_names.contains(&name) {
+                block_names.push(name);
             }
         }
 
-        // If no XML skills found, try Hermes plain-text format
-        if skill_names.is_empty() {
+        // If no XML skills found in this block, try Hermes plain-text format
+        if block_names.is_empty() {
             for name_match in RE_HERMES_SKILL_ENTRY.captures_iter(block) {
                 let name = name_match[1].to_string();
-                if !name.is_empty() && !skill_names.contains(&name) {
-                    skill_names.push(name);
+                if !name.is_empty() && !block_names.contains(&name) {
+                    block_names.push(name);
                 }
+            }
+        }
+
+        for name in block_names {
+            if !skill_names.contains(&name) {
+                skill_names.push(name);
             }
         }
     }
@@ -513,6 +531,41 @@ Some text after"#;
     }
 
     #[test]
+    fn test_parse_available_skills_two_hermes_blocks() {
+        // Hermes agents re-emit the skill list mid-conversation; every
+        // plain-text block must be parsed, not only the first one.
+        let text = "<available_skills>
+  - pdf: Read and write PDF files
+  - excel: Work with spreadsheets
+</available_skills>
+
+the list is refreshed later in the prompt:
+
+<available_skills>
+  - web-search: Search the web
+</available_skills>";
+
+        let result = parse_available_skills(text);
+        assert_eq!(result, vec!["pdf", "excel", "web-search"]);
+    }
+
+    #[test]
+    fn test_parse_available_skills_xml_then_hermes_block() {
+        // A Hermes plain-text block after an XML (cosh) block must still
+        // contribute its skills.
+        let text = "<available_skills>
+<skill><name>ui-designer</name><description>Web UI design expert</description></skill>
+</available_skills>
+
+<available_skills>
+  - create-skill: Create a new skill from a template
+</available_skills>";
+
+        let result = parse_available_skills(text);
+        assert_eq!(result, vec!["ui-designer", "create-skill"]);
+    }
+
+    #[test]
     fn test_extract_file_path_object() {
         let args = json!({"file_path": "/path/to/my-skill/SKILL.md"});
         assert_eq!(
@@ -574,8 +627,8 @@ Some text after"#;
             pid: Some(100),
             user_query: None,
             event_json: None,
-            trace_id: Some("session-1".into()),
-            conversation_id: Some("conv-1".into()),
+            trace_id: Some("resp-1".into()),
+            conversation_id: Some("session-1".into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,
@@ -613,8 +666,8 @@ Some text after"#;
             pid: Some(9999),
             user_query: None,
             event_json: None,
-            trace_id: Some("cosh-session-1".into()),
-            conversation_id: Some("cosh-conv-1".into()),
+            trace_id: Some("resp-cosh-1".into()),
+            conversation_id: Some("cosh-session-1".into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,
@@ -826,8 +879,8 @@ Some text after"#;
             pid: Some(8888),
             user_query: None,
             event_json: None,
-            trace_id: Some("qwen-session-1".into()),
-            conversation_id: Some("qwen-conv-1".into()),
+            trace_id: Some("resp-qwen-1".into()),
+            conversation_id: Some("qwen-session-1".into()),
             cache_read_tokens: None,
             status: Some("complete".into()),
             interruption_type: None,

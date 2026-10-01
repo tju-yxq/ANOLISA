@@ -21,15 +21,16 @@
 //! ```
 
 use crate::aggregator::AggregatedResult;
-use crate::analyzer::token::extract_response_content;
+use crate::analyzer::token::merge_response_output_text;
 use crate::parser::sse::{ParsedSseEvent, SSEParser};
 use crate::tokenizer::LlmTokenizer;
 use crate::tokenizer::get_global_tokenizer;
 
 use super::result::{MessageTokenCount, OutputTokenCount, TokenConsumptionBreakdown};
+use super::token::merge_usage;
 use super::{
-    AnalysisResult, AuditAnalyzer, HttpRecord, LLMProvider, MessageParser, ParsedApiMessage,
-    TokenParser, TokenRecord, TokenUsage,
+    AnalysisResult, AuditAnalyzer, HttpRecord, MessageParser, ParsedApiMessage, TokenParser,
+    TokenRecord, TokenUsage,
 };
 
 /// Token count result for request messages
@@ -56,6 +57,23 @@ pub struct ResponseTokenCount {
     pub by_type: std::collections::HashMap<String, usize>,
     /// Per-content-block token counts
     pub per_block: Vec<OutputTokenCount>,
+}
+
+/// Request body → the message list the chat template consumes.
+///
+/// Both local extractors in this module used to recognize only the shapes they
+/// were written against, so a request the capture pipeline understood was
+/// counted as if it carried no messages at all. Share the parser-layer
+/// request view so every protocol shape is counted the same way: OpenAI `messages`,
+/// Responses `input` (array or string) with `instructions`, DashScope native
+/// `input.messages`, and an Anthropic top-level `system`, which is prepended as
+/// a system message because the template expects it inside the array.
+fn request_messages(body: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    let (mut messages, instructions) = crate::parser::llm::extract_messages_view(body)?;
+    if let Some(system) = instructions.filter(|text| !text.is_empty()) {
+        messages.insert(0, serde_json::json!({"role": "system", "content": system}));
+    }
+    Some(messages)
 }
 
 /// Count tokens in a request JSON using the provided tokenizer and chat template
@@ -86,7 +104,7 @@ pub fn count_request_tokens(
     chat_template: &LlmTokenizer,
 ) -> Option<RequestTokenCount> {
     // Extract messages
-    let messages = request_json.get("messages").and_then(|m| m.as_array())?;
+    let messages = request_messages(request_json)?;
 
     if messages.is_empty() {
         return None;
@@ -99,13 +117,14 @@ pub fn count_request_tokens(
     let template_messages: Vec<serde_json::Value> = messages.to_vec();
 
     // Extract tools JSON array for passing to template
-    let tools_json: Option<Vec<serde_json::Value>> = request_json
-        .get("tools")
-        .and_then(|t| t.as_array())
-        .map(|arr| arr.to_vec());
+    let tools_json: Option<Vec<serde_json::Value>> =
+        crate::parser::llm::extract_tools_view(request_json);
 
-    // Count tools tokens separately (for informational breakdown)
-    let mut tools_tokens: usize = tools_json
+    // Count tool definitions separately (for informational breakdown). The
+    // count is also folded into the first tool-role message below so the
+    // per-message distribution covers it; the reported field keeps the
+    // definition count itself.
+    let tool_definition_tokens: usize = tools_json
         .as_ref()
         .map(|arr| {
             arr.iter()
@@ -114,6 +133,7 @@ pub fn count_request_tokens(
                 .sum()
         })
         .unwrap_or(0);
+    let mut fold_into_tool_message = tool_definition_tokens;
 
     // Use apply_chat_template_with_tools to format all messages WITH tools
     // This ensures the tools instruction text is included in the total count
@@ -143,8 +163,8 @@ pub fn count_request_tokens(
             .unwrap_or("unknown")
             .to_string();
         if role == "tool" {
-            tokens += tools_tokens;
-            tools_tokens = 0;
+            tokens += fold_into_tool_message;
+            fold_into_tool_message = 0;
         }
         raw_per_message.push((role, tokens));
     }
@@ -173,12 +193,11 @@ pub fn count_request_tokens(
         }
     }
     let system_prompt_tokens = by_role.get("system").cloned().unwrap_or(0);
-    let tools_tokens = by_role.get("tool").cloned().unwrap_or(0);
     Some(RequestTokenCount {
         total_tokens,
         by_role,
         per_message,
-        tools_tokens,
+        tools_tokens: tool_definition_tokens,
         system_prompt_tokens,
     })
 }
@@ -215,28 +234,10 @@ pub fn count_response_tokens(
     let mut by_type: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut per_block: Vec<OutputTokenCount> = Vec::new();
 
-    // Accumulate content from all SSE chunks
-    let mut all_content = String::new();
-    let mut all_reasoning = String::new();
-    let mut all_tool_calls = Vec::new();
-
-    for chunk in response_jsons {
-        if let Some((content, reasoning, tool_calls)) = extract_response_content(Some(chunk)) {
-            if !content.is_empty() {
-                all_content.push_str(&content);
-            }
-            if let Some(r) = reasoning {
-                if !r.is_empty() {
-                    all_reasoning.push_str(&r);
-                }
-            }
-            for tc in tool_calls {
-                if !tc.is_empty() {
-                    all_tool_calls.push(tc);
-                }
-            }
-        }
-    }
+    // Accumulate content from all SSE chunks. The shared merge counts each
+    // delta once and reads the Responses closing events only as a fallback,
+    // so a complete capture is not counted two or three times.
+    let (all_content, all_reasoning, all_tool_calls) = merge_response_output_text(response_jsons);
 
     let mut has_content = false;
 
@@ -434,6 +435,7 @@ impl Analyzer {
     /// `AnalysisResult::Token` for SSE streams containing token usage,
     /// or `AnalysisResult::Message` for parsed LLM API request/response bodies.
     pub fn analyze_aggregated(&self, result: &AggregatedResult) -> Vec<AnalysisResult> {
+        let timer = crate::runtime_metrics::StageTimer::start("analyzer");
         log::debug!("Analyzing aggregated result({})", result.result_type());
         let mut results = Vec::new();
 
@@ -442,6 +444,7 @@ impl Analyzer {
             if let Some(record) = self.audit.analyze(result) {
                 results.push(AnalysisResult::Audit(record));
             }
+            timer.record_outputs(results.len());
             return results;
         }
 
@@ -499,11 +502,23 @@ impl Analyzer {
         if let Some(http_record) = self.extract_http_record(result) {
             if token_result.is_none() && http_record.is_sse {
                 if let Some(body) = &http_record.response_body {
-                    if let Ok(x) = serde_json::from_str::<Vec<serde_json::Value>>(body) {
-                        if let Some(last) = x.last() {
-                            let parser = TokenParser::new();
-                            if let Some(usage) = parser.parse_json(last) {
-                                let record = TokenRecord::new(
+                    // An HTTP/2 SSE body has no `ParsedSseEvent`s, so the h2
+                    // path never reaches `extract_token_from_sse`; this array is
+                    // its only token source. It must merge like every other SSE
+                    // path: Anthropic splits usage across `message_start`
+                    // (input + cache) and `message_delta` (output) and ends with
+                    // a usage-free `message_stop`, so taking the last event
+                    // yields either no record at all or one with a zero input
+                    // count.
+                    if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(body) {
+                        let parser = TokenParser::new();
+                        let usage = events
+                            .iter()
+                            .filter_map(|event| parser.parse_json(event))
+                            .fold(None, merge_usage);
+                        token_result = usage
+                            .map(|usage| {
+                                TokenRecord::new(
                                     http_record.pid,
                                     http_record.comm.clone(),
                                     usage.provider.to_string(),
@@ -514,11 +529,14 @@ impl Analyzer {
                                 .with_cache_tokens(
                                     usage.cache_creation_input_tokens.unwrap_or(0),
                                     usage.cache_read_input_tokens.unwrap_or(0),
-                                );
-
-                                token_result = Some(record);
-                            }
-                        }
+                                )
+                            })
+                            // This site runs only because the primary
+                            // extraction already returned `None`, and both
+                            // extractors refuse an all-zero usage. Without the
+                            // same guard a zero-placeholder stream reappears
+                            // here as a bogus zero row in the token database.
+                            .filter(|record| record.total_tokens() > 0);
                     }
                 }
             }
@@ -559,6 +577,7 @@ impl Analyzer {
             }
         }
 
+        timer.record_outputs(results.len());
         results
     }
 
@@ -684,34 +703,47 @@ impl Analyzer {
         let mut usage = sse_events
             .iter()
             .filter_map(|e| self.token.parse_event(e))
-            .fold(None, Self::merge_usage);
+            .fold(None, merge_usage);
 
-        if usage.is_none() {
-            // Fallback: OpenAI Responses API embeds usage in a final
-            // `response.completed` event whose `data:` field routinely
-            // exceeds a single TLS record. The aggregator buffers the
-            // raw continuation bytes; re-parse them with the legacy
-            // SSEParser (which concatenates multi-line data fields)
-            // and merge all events. If reassembled events still don't
-            // yield usage, fall back to a partial-scan over the raw
-            // buffer text.
-            if let Some(extra) = continuation_bytes {
-                let text = String::from_utf8_lossy(extra);
-                let reassembled = SSEParser::parse_stream(&text);
-                usage = reassembled
-                    .events
-                    .iter()
-                    .filter_map(|e| self.token.parse_data(&e.data))
-                    .fold(None, Self::merge_usage);
+        // The continuation buffer holds the bytes of events a TLS record split,
+        // and a split event produces no `ParsedSseEvent` of its own. Its usage
+        // therefore has to be merged into what the events yielded, not used
+        // only as a replacement for "nothing at all": Anthropic splits its
+        // counters across events (`message_start` carries input plus the cache
+        // counters and a placeholder `output_tokens` of 1, the terminal
+        // `message_delta` carries the real output count), so a split that lands
+        // on the terminal event left the placeholder in place while the bytes
+        // that would correct it sat unread in the same call. `merge_usage` takes
+        // the max of each cumulative counter, so folding the reassembled events
+        // in can only raise a counter, never lose one.
+        if let Some(extra) = continuation_bytes {
+            // Re-parse with the legacy SSEParser, which concatenates
+            // multi-line `data:` fields — what the OpenAI Responses API's
+            // final `response.completed` event needs when its payload exceeds
+            // a single record.
+            let text = String::from_utf8_lossy(extra);
+            let reassembled = SSEParser::parse_stream(&text);
+            let from_reassembled = reassembled
+                .events
+                .iter()
+                .filter_map(|e| self.token.parse_data(&e.data))
+                .fold(None, merge_usage);
+            if let Some(from_reassembled) = from_reassembled {
+                usage = merge_usage(usage, from_reassembled);
+            }
+            if usage.is_none() {
+                // Last resort: a regex-free scan over the raw buffer text. It
+                // reads the number after a usage field name in arbitrary text,
+                // so it only runs when nothing parseable was recovered — over a
+                // stream that already produced exact counters it could only add
+                // noise.
+                usage = self.token.parse_data(&text);
                 if usage.is_none() {
-                    usage = self.token.parse_data(&text);
-                    if usage.is_none() {
-                        log::debug!(
-                            "[extract_token_from_sse] continuation buffer scan miss: len={} reassembled_events={}",
-                            extra.len(),
-                            reassembled.events.len(),
-                        );
-                    }
+                    log::debug!(
+                        "[extract_token_from_sse] continuation buffer scan miss: len={} reassembled_events={}",
+                        extra.len(),
+                        reassembled.events.len(),
+                    );
                 }
             }
         }
@@ -739,43 +771,6 @@ impl Analyzer {
         }
 
         Some(record)
-    }
-
-    /// Merge two token-usage snapshots from the same SSE stream.
-    ///
-    /// All counters are cumulative within a stream, so the max resolves the
-    /// split-across-events case (message_start input/cache vs message_delta
-    /// output) and tolerates zero-placeholder events without ever regressing a
-    /// larger value. Model and provider are taken from the first event that
-    /// carries them.
-    fn merge_usage(acc: Option<TokenUsage>, next: TokenUsage) -> Option<TokenUsage> {
-        let Some(mut cur) = acc else {
-            return Some(next);
-        };
-        cur.input_tokens = cur.input_tokens.max(next.input_tokens);
-        cur.output_tokens = cur.output_tokens.max(next.output_tokens);
-        cur.cache_creation_input_tokens = Self::max_opt(
-            cur.cache_creation_input_tokens,
-            next.cache_creation_input_tokens,
-        );
-        cur.cache_read_input_tokens =
-            Self::max_opt(cur.cache_read_input_tokens, next.cache_read_input_tokens);
-        if cur.model.is_none() {
-            cur.model = next.model;
-        }
-        if cur.provider == LLMProvider::Unknown {
-            cur.provider = next.provider;
-        }
-        Some(cur)
-    }
-
-    /// Max of two optional counters, preserving a value when only one is set.
-    fn max_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
-        match (a, b) {
-            (Some(x), Some(y)) => Some(x.max(y)),
-            (x, None) => x,
-            (None, y) => y,
-        }
     }
 
     fn extract_token_from_json_body(
@@ -878,30 +873,11 @@ impl Analyzer {
             "openai"
         };
 
-        // Count input tokens from request messages using chat template.
-        // Supports both OpenAI chat completions format (top-level "messages")
-        // and Responses API format (top-level "input" + "instructions").
-        let messages_owned: Option<Vec<serde_json::Value>> = request_json_ref
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .or_else(|| {
-                let input = request_json_ref.get("input").and_then(|m| m.as_array())?;
-                let mut combined = Vec::new();
-                if let Some(instr) = request_json_ref
-                    .get("instructions")
-                    .and_then(|s| s.as_str())
-                {
-                    if !instr.is_empty() {
-                        combined.push(serde_json::json!({
-                            "role": "system",
-                            "content": instr,
-                        }));
-                    }
-                }
-                combined.extend(input.iter().cloned());
-                Some(combined)
-            });
+        // Count input tokens from request messages using chat template. The
+        // same parser as `count_request_tokens`: OpenAI chat completions,
+        // Responses `input` + `instructions`, DashScope native `input.messages`
+        // and the Anthropic top-level `system`.
+        let messages_owned: Option<Vec<serde_json::Value>> = request_messages(request_json_ref);
 
         let input_tokens = if let Some(messages) = messages_owned {
             if messages.is_empty() {
@@ -933,10 +909,8 @@ impl Analyzer {
                 }
 
                 // Extract tools JSON array for passing to template
-                let tools_json: Option<Vec<serde_json::Value>> = request_json_ref
-                    .get("tools")
-                    .and_then(|t| t.as_array())
-                    .map(|arr| arr.to_vec());
+                let tools_json: Option<Vec<serde_json::Value>> =
+                    crate::parser::llm::extract_tools_view(request_json_ref);
                 let tools_slice = tools_json.as_deref();
 
                 // Apply chat template with tools to get the actual prompt sent to LLM
@@ -959,31 +933,12 @@ impl Analyzer {
             0
         };
 
-        // Count output tokens from SSE events content
+        // Count output tokens from SSE events content. The shared merge counts
+        // each delta once and reads the Responses closing events only as a
+        // fallback, so a complete capture is not counted two or three times.
         let output_tokens = {
-            let mut all_content = String::new();
-            let mut all_reasoning = String::new();
-            let mut all_tool_calls = Vec::new();
-
-            for chunk in &sse_chunks {
-                if let Some((content, reasoning, tool_calls)) =
-                    extract_response_content(Some(chunk))
-                {
-                    if !content.is_empty() {
-                        all_content.push_str(&content);
-                    }
-                    if let Some(r) = reasoning {
-                        if !r.is_empty() {
-                            all_reasoning.push_str(&r);
-                        }
-                    }
-                    for tc in tool_calls {
-                        if !tc.is_empty() {
-                            all_tool_calls.push(tc);
-                        }
-                    }
-                }
-            }
+            let (all_content, all_reasoning, all_tool_calls) =
+                merge_response_output_text(&sse_chunks);
 
             let mut total = 0u64;
 
@@ -1571,7 +1526,7 @@ mod tests {
     ) -> crate::aggregator::Http2Stream {
         let response_body = sse_chunk.map_or_else(
             || "data: [DONE]\n\n".to_string(),
-            |chunk| format!("data: {}\n\ndata: [DONE]\n\n", chunk),
+            |chunk| format!("data: {chunk}\n\ndata: [DONE]\n\n"),
         );
         build_http2_stream(
             path,
@@ -1690,6 +1645,78 @@ mod tests {
                 _ => None,
             })
             .expect("Analyzer must emit HttpRecord")
+    }
+
+    /// An HTTP/2 SSE stream splits Anthropic usage across events and ends with a
+    /// usage-free `message_stop`. Parsing only the last event therefore produced
+    /// no token record at all, so h2 streaming calls were missing from the token
+    /// database while the same call's genai trace showed the right usage.
+    #[test]
+    fn http2_sse_token_record_merges_usage_across_events() {
+        let analyzer = Analyzer::new();
+        let request_body = br#"{"model":"claude-sonnet-4-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1234,",
+            "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":90,\"output_tokens\":1}}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":42}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let stream = build_http2_stream(
+            "/v1/messages",
+            request_body,
+            body.as_bytes().to_vec(),
+            "text/event-stream",
+        );
+
+        let record = analyzer
+            .analyze_aggregated(&AggregatedResult::Http2StreamComplete(stream))
+            .into_iter()
+            .find_map(|result| match result {
+                AnalysisResult::Token(record) => Some(record),
+                _ => None,
+            })
+            .expect("an Anthropic h2 SSE stream must yield a merged TokenRecord");
+
+        assert_eq!(record.input_tokens, 1234, "input comes from message_start");
+        assert_eq!(record.output_tokens, 42, "output comes from message_delta");
+        assert_eq!(record.cache_read_tokens, Some(90));
+        assert_eq!(record.provider, "anthropic");
+    }
+
+    /// The h2 SSE fallback runs exactly when the primary extraction returned
+    /// `None`, so it must apply the same all-zero guard as
+    /// `extract_token_from_sse` and `extract_token_from_json_body`. A stream
+    /// whose only parseable usage is zeroed (a proxy's zero-placeholder
+    /// `message_start` plus an aborted terminal `message_delta`) was rejected by
+    /// the primary extraction and then re-created here, leaving a bogus
+    /// zero-token row in the token database.
+    #[test]
+    fn http2_sse_zero_usage_does_not_produce_a_token_record() {
+        let analyzer = Analyzer::new();
+        let request_body = br#"{"model":"claude-sonnet-4-5","max_tokens":1024,"messages":[{"role":"user","content":"hi"}]}"#;
+        let body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,",
+            "\"output_tokens\":0}}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":0}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n"
+        );
+        let stream = build_http2_stream(
+            "/v1/messages",
+            request_body,
+            body.as_bytes().to_vec(),
+            "text/event-stream",
+        );
+
+        let results = analyzer.analyze_aggregated(&AggregatedResult::Http2StreamComplete(stream));
+        assert!(
+            !results
+                .iter()
+                .any(|result| matches!(result, AnalysisResult::Token(_))),
+            "an all-zero h2 SSE usage must not yield a TokenRecord: {results:?}"
+        );
     }
 
     #[test]
@@ -2065,6 +2092,49 @@ data:{"usage":{"input_tokens":57,"output_tokens":3}}"#;
         assert_eq!(record.cache_read_tokens, Some(90));
     }
 
+    /// Anthropic splits its counters across events, and the terminal one can be
+    /// split by a TLS record — in which case it produces no `ParsedSseEvent` and
+    /// its bytes exist only in the continuation buffer. That buffer used to be
+    /// consulted only when *no* event yielded usage, so the terminal event's
+    /// real count was invisible whenever the earlier `message_start` had already
+    /// supplied the placeholder `output_tokens: 1`.
+    #[test]
+    fn a_split_terminal_usage_event_is_merged_into_the_partial_counters() {
+        let analyzer = Analyzer::new();
+        let events = vec![create_test_event(
+            "data: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":1234,\"output_tokens\":1}}}",
+        )];
+        // The tail of the terminal event, as the aggregator buffered it: the
+        // parser keeps no cross-read remainder, so these bytes arrive as RawData.
+        let continuation = b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n";
+
+        let record = analyzer
+            .extract_token_from_sse(&events, Some(continuation), 1234, "test")
+            .expect("the split terminal event must still produce a record");
+
+        assert_eq!(record.input_tokens, 1234);
+        assert_eq!(record.output_tokens, 42);
+    }
+
+    #[test]
+    fn a_continuation_buffer_cannot_lower_the_event_counters() {
+        // The merge takes the max of each counter, so a continuation buffer
+        // whose text mentions a smaller count leaves the exact value in place.
+        let analyzer = Analyzer::new();
+        let events = vec![create_test_event(
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":1234,\"output_tokens\":42}}",
+        )];
+        let continuation =
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n";
+
+        let record = analyzer
+            .extract_token_from_sse(&events, Some(continuation), 1234, "test")
+            .expect("the event usage must be kept");
+
+        assert_eq!(record.input_tokens, 1234);
+        assert_eq!(record.output_tokens, 42);
+    }
+
     #[test]
     fn test_extract_token_from_sse_anthropic_no_message_start() {
         // Dialect B: proxy strips message_start entirely; only message_delta
@@ -2160,5 +2230,142 @@ data:{"usage":{"input_tokens":57,"output_tokens":3}}"#;
             assert_eq!(record.input_tokens, 42);
             assert_eq!(record.output_tokens, 7);
         }
+    }
+
+    /// Anthropic carries the system prompt outside the messages array; the
+    /// template only sees the array, so the request used to be counted without
+    /// its system prompt.
+    #[test]
+    fn request_messages_includes_the_anthropic_system_prompt() {
+        let body = serde_json::json!({
+            "model": "claude-x",
+            "system": "SYSPROMPT",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let messages = request_messages(&body).expect("messages exist");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "SYSPROMPT");
+        assert_eq!(messages[1]["content"], "hi");
+    }
+
+    /// DashScope's native protocol wraps the messages under `input`; the local
+    /// extractors only looked at a top-level `messages`, so such a request
+    /// produced no count at all.
+    #[test]
+    fn request_messages_reads_dashscope_native_input_messages() {
+        let body = serde_json::json!({
+            "model": "qwen-flash",
+            "input": {"messages": [{"role": "user", "content": "hi"}]},
+            "parameters": {"incremental_output": true, "result_format": "message"}
+        });
+        let messages = request_messages(&body).expect("input.messages exists");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hi");
+    }
+
+    /// Guard: the shapes the extractors already handled keep theirs.
+    #[test]
+    fn request_messages_keeps_the_existing_shapes() {
+        let chat = serde_json::json!({"messages": [{"role": "user", "content": "a"}]});
+        assert_eq!(request_messages(&chat).map(|m| m.len()), Some(1));
+
+        let responses = serde_json::json!({
+            "input": [{"role": "user", "content": "b"}],
+            "instructions": "INSTR"
+        });
+        let messages = request_messages(&responses).expect("input array");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"], "INSTR");
+        assert_eq!(messages[1]["content"], "b");
+
+        assert!(request_messages(&serde_json::json!({"model": "x"})).is_none());
+    }
+
+    /// Minimal word-level tokenizer so the manual counters run without the
+    /// network or the real Qwen tokenizer, which is not vendored here.
+    fn fixture_word_level_tokenizer(suffix: &str) -> LlmTokenizer {
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight_analyzer_fixture_{suffix}_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let tokenizer_path = dir.join("tokenizer.json");
+        let config_path = dir.join("tokenizer_config.json");
+        std::fs::write(
+            &tokenizer_path,
+            r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Whitespace"},
+  "post_processor": null,
+  "decoder": null,
+  "model": {"type": "WordLevel", "vocab": {"[UNK]": 0}, "unk_token": "[UNK]"}
+}"#,
+        )
+        .expect("write tokenizer.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+  "tokenizer_class": "PreTrainedTokenizerFast",
+  "chat_template": "{% for message in messages %}{{ message['role'] + '\n' + message['content'] + '\n' }}{% endfor %}",
+  "bos_token": null,
+  "eos_token": null,
+  "unk_token": "[UNK]",
+  "model_max_length": 32768
+}"#,
+        )
+        .expect("write tokenizer config");
+        LlmTokenizer::from_file(&tokenizer_path, &config_path).expect("fixture tokenizer loads")
+    }
+
+    /// A Responses turn whose output is a function call must be counted: the
+    /// extractor recognised none of the protocol's function-call events, so
+    /// `by_type["tool_calls"]` stayed absent and a tool-only turn counted as
+    /// producing nothing. `count_response_tokens` is the consumer that fixes
+    /// the `name: arguments` shape the fragments must reconstruct.
+    #[test]
+    fn count_response_tokens_counts_responses_function_calls() {
+        let tokenizer = fixture_word_level_tokenizer("responses_fc");
+        let response_jsons = vec![
+            serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                },
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "delta": "{\"path\":",
+            }),
+            serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "output_index": 0,
+                "delta": "\"/tmp/a.md\"}",
+            }),
+        ];
+
+        let count = count_response_tokens(&response_jsons, &tokenizer).expect("count");
+
+        assert!(
+            count.by_type.get("tool_calls").copied().unwrap_or(0) > 0,
+            "the Responses function call must be counted, got {:?}",
+            count.by_type
+        );
+        assert!(
+            count.total_tokens > 0,
+            "a tool-only Responses turn must not count as zero output tokens"
+        );
     }
 }
