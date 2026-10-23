@@ -167,16 +167,82 @@ pub(crate) fn span_safe(value: &str) -> String {
     value.replace('`', "'")
 }
 
-/// Quote a value as a code span, sanitized. Backticks and sanitization
-/// are inseparable here, so a rule cannot add the quoting without the
-/// sanitization.
+/// Longest run of consecutive backticks in `value`.
+fn longest_backtick_run(value: &str) -> usize {
+    let (mut longest, mut current) = (0usize, 0usize);
+    for byte in value.bytes() {
+        if byte == b'`' {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
+}
+
+/// Quote a value as a code span **without changing it**.
+///
+/// The values quoted this way are file paths, tool names and queries, where a
+/// backtick is a legal character rather than markup. Rewriting it would make
+/// the body name a different path than `related_paths` and than the file that
+/// was actually read.
+///
+/// The span is widened instead: `normalize_relative_dates` pairs runs of equal
+/// length, so a fence one backtick longer than the longest run inside the value
+/// cannot collide with it and the span still parses.
 pub(crate) fn code_span(value: &str) -> String {
-    format!("`{}`", span_safe(value))
+    let fence = "`".repeat(longest_backtick_run(value) + 1);
+    format!("{fence}{value}{fence}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_span_preserves_a_backtick_in_a_path() {
+        // A backtick is legal in a file name; the span must widen, not rewrite.
+        assert_eq!(code_span("notes/we`ird/a.md"), "``notes/we`ird/a.md``");
+        assert_eq!(code_span("notes/plain.md"), "`notes/plain.md`");
+    }
+
+    #[test]
+    fn code_span_widens_past_the_longest_inner_run() {
+        assert_eq!(code_span("a``b"), "```a``b```");
+        assert_eq!(code_span("no backticks"), "`no backticks`");
+    }
+
+    #[test]
+    fn code_span_round_trips_the_value() {
+        let raw = "notes/we`ird/a.md";
+        let spanned = code_span(raw);
+        let fence_len = spanned.bytes().take_while(|&b| b == b'`').count();
+        assert_eq!(&spanned[fence_len..spanned.len() - fence_len], raw);
+    }
+
+    #[test]
+    fn quoted_path_with_backtick_survives_body_rendering() {
+        // The rendered body must name the file that was actually read.
+        let f = ConsolidatedFact::new(
+            "sid",
+            FactCategory::WorkingContext,
+            "Read a file".into(),
+            format!("Read {}", code_span("notes/we`ird/a.md")),
+            "mem_read".into(),
+            vec!["notes/we`ird/a.md".into()],
+            0.9,
+        );
+        let body = f.content;
+        assert!(
+            body.contains("notes/we`ird/a.md"),
+            "body lost the backtick: {body}"
+        );
+        assert!(
+            !body.contains("notes/we'ird/a.md"),
+            "body rewrote the path: {body}"
+        );
+    }
 
     #[test]
     fn fact_new_generates_ulid() {

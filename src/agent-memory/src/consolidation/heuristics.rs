@@ -519,29 +519,44 @@ mod tests {
 
     #[test]
     fn interpolated_values_cannot_break_the_span_structure() {
-        // A query pasted from markdown can carry backticks; the emitted
-        // fact must keep the value inside its single quoted span
-        // (backticks swapped for apostrophes) so the date normalizer's
-        // run pairing stays intact.
+        // A query pasted from markdown can carry backticks. The value must be
+        // preserved verbatim -- a backtick is legal in a path -- so the span is
+        // widened instead of rewritten: the fence is one backtick longer than
+        // the longest run inside the value, which the date normalizer's
+        // equal-length run pairing cannot mistake for a closer.
         let entries = vec![make_entry(
             "memory_search",
             "bm25:``today`` and `yesterday` notes",
             true,
             None,
         )];
+        // rule_interest drops the "bm25:" prefix before interpolating.
+        let raw = "``today`` and `yesterday` notes";
         let facts = rule_interest(&entries, "sid");
         assert_eq!(facts.len(), 1);
+
+        // The value survives untouched, backticks included.
         assert!(
-            !facts[0].content.contains("``"),
-            "no backtick run may survive interpolation, got: {}",
+            facts[0].content.contains(raw),
+            "the interpolated value must stay verbatim, got: {}",
             facts[0].content
         );
-        // The sanitized value stays one span and survives the date
-        // normalizer verbatim, keywords included.
+
+        // The fence is longer than any run inside, so the span still closes.
+        let fence = "`".repeat(3);
+        assert!(
+            facts[0].content.contains(&format!("{fence}{raw}{fence}")),
+            "expected a {}-backtick fence around the value, got: {}",
+            3,
+            facts[0].content
+        );
+
+        // The normalizer copies the span verbatim: dates inside a quoted value
+        // are not rewritten, which is the whole point of quoting the path.
         let normalized = normalize_relative_dates(&facts[0].content);
         assert!(
-            normalized.contains("'today'") && normalized.contains("'yesterday'"),
-            "the sanitized span must survive normalization verbatim, got: {normalized}"
+            normalized.contains(raw),
+            "the quoted span must survive normalization verbatim, got: {normalized}"
         );
     }
 
